@@ -13,6 +13,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import mock
 from testtools import matchers
 
 from neutron.ipam.drivers.infoblox import objects
@@ -289,12 +290,16 @@ class FixedAddressIPv6TestCase(base.BaseTestCase):
         fa = objects.FixedAddressIPv6.from_dict(fixed_address)
         self.assertEqual(fa.ip, ip)
 
+    @mock.patch.object(objects, 'generate_duid',
+                       mock.Mock(return_value=None))
     def test_dict_contains_mac_ip_and_net_view(self):
         expected_ip = "2001:DB8::3"
         duid = "aa:bb:cc:dd:ee:ff"
         expected_duid = "00:03:00:01:aa:bb:cc:dd:ee:ff"
         expected_net_view = "test-net-view-name"
         expected_extattrs = "test-extattrs"
+
+        objects.generate_duid.return_value = expected_duid
 
         expected_dict = {
             'duid': expected_duid,

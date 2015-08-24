@@ -458,6 +458,8 @@ class L3_NAT_dbonly_mixin(l3.RouterPluginBase):
                                               subnet['id'],
                                               subnet['cidr'])
             port.update({'device_id': router.id, 'device_owner': owner})
+            ipam = manager.NeutronManager.get_ipam()
+            ipam.update_port(context, port)
             return port
 
     def _add_interface_by_subnet(self, context, router, subnet_id, owner):

@@ -182,7 +182,7 @@ class AllocateIPTestCase(base.BaseTestCase):
 
         subnet = {'tenant_id': 'some-id', 'id': 'some-id'}
         mac = 'aa:bb:cc:dd:ee:ff'
-        port = {'id': hostname,
+        port = {'id': 'port_id',
                 'mac_address': mac}
         ip_dict = {'ip_address': '192.168.1.1',
                    'subnet_id': 'fake-id'}
@@ -197,7 +197,7 @@ class AllocateIPTestCase(base.BaseTestCase):
         b.allocate_ip(context, subnet, port, ip_dict)
 
         ip_allocator.allocate_given_ip.assert_called_once_with(
-            mock.ANY, mock.ANY, mock.ANY, hostname, mac, ip['ip_address'],
+            mock.ANY, mock.ANY, mock.ANY, mock.ANY, mac, ip['ip_address'],
             mock.ANY)
 
     def test_host_record_from_range_created_on_allocate_ip(self):
@@ -253,8 +253,9 @@ class AllocateIPTestCase(base.BaseTestCase):
 
         assert not infoblox.create_host_record_range.called
         assert not infoblox.create_host_record_ip.called
-        self.assertRaises(ib_exceptions.InfobloxCannotAllocateIpForSubnet,
-                          b.allocate_ip, context, subnet, host)
+
+        ip = b.allocate_ip(context, subnet, host)
+        self.assertIsNone(ip)
 
 
 class DeallocateIPTestCase(base.BaseTestCase):
@@ -391,12 +392,15 @@ class DnsNameserversTestCase(base.BaseTestCase):
 
 
 class DeleteSubnetTestCase(base.BaseTestCase):
+    @mock.patch.object(infoblox_db, 'is_network_external',
+                       mock.Mock())
     def test_ib_network_deleted(self):
         infoblox = mock.Mock()
         member_conf = mock.Mock()
         config = mock.Mock()
         config.dhcp_members = ['member1.com']
         config.dns_members = ['member1.com']
+        config.is_global_config = False
         member_conf.find_config_for_subnet = mock.Mock(return_value=config)
         ip_allocator = mock.Mock()
         context = mock.MagicMock()
@@ -408,6 +412,12 @@ class DeleteSubnetTestCase(base.BaseTestCase):
         b = ipam_controller.InfobloxIPAMController(infoblox,
                                                    member_conf,
                                                    ip_allocator)
+        b._get_network = mock.Mock()
+        b._get_network.return_value = {
+            'network_id': 'some-net-id',
+            'shared': False
+        }
+        infoblox_db.is_network_external.return_value = False
 
         b.delete_subnet(context, subnet)
 
@@ -548,9 +558,9 @@ class CreateSubnetFlowNiosNetExistsTestCase(base.BaseTestCase):
     def test_nios_network_is_updated_for_shared_os_network(self):
         self.b.ea_manager.get_extattrs_for_network = mock.Mock(
             return_value={
-                ea_manager.InfobloxEaManager.INFOBLOX_IS_EXTERNAL: {
+                'Is External': {
                     'value': 'False'},
-                ea_manager.InfobloxEaManager.INFOBLOX_IS_SHARED: {
+                'Is Shared': {
                     'value': 'True'}
             })
 
@@ -563,9 +573,9 @@ class CreateSubnetFlowNiosNetExistsTestCase(base.BaseTestCase):
     def test_nios_network_is_updated_for_shared_external_os_network(self):
         self.b.ea_manager.get_extattrs_for_network = mock.Mock(
             return_value={
-                ea_manager.InfobloxEaManager.INFOBLOX_IS_EXTERNAL: {
+                'Is External': {
                     'value': 'True'},
-                ea_manager.InfobloxEaManager.INFOBLOX_IS_SHARED: {
+                'Is Shared': {
                     'value': 'True'}
             })
 
@@ -578,9 +588,9 @@ class CreateSubnetFlowNiosNetExistsTestCase(base.BaseTestCase):
     def test_nios_network_is_updated_for_external_os_network(self):
         self.b.ea_manager.get_extattrs_for_network = mock.Mock(
             return_value={
-                ea_manager.InfobloxEaManager.INFOBLOX_IS_EXTERNAL: {
+                'Is External': {
                     'value': 'True'},
-                ea_manager.InfobloxEaManager.INFOBLOX_IS_SHARED: {
+                'Is Shared': {
                     'value': 'False'}
             })
 
@@ -593,9 +603,9 @@ class CreateSubnetFlowNiosNetExistsTestCase(base.BaseTestCase):
     def test_exception_is_raised_if_network_is_private(self):
         self.b.ea_manager.get_extattrs_for_network = mock.Mock(
             return_value={
-                ea_manager.InfobloxEaManager.INFOBLOX_IS_EXTERNAL: {
+                'Is External': {
                     'value': 'False'},
-                ea_manager.InfobloxEaManager.INFOBLOX_IS_SHARED: {
+                'Is Shared': {
                     'value': 'False'}
             })
 
@@ -733,8 +743,8 @@ class DeleteNetworkTestCase(base.BaseTestCase):
                                                    ib_db)
         b.delete_network(context, network_id)
 
-        assert not infoblox.delete_object_by_ref.called
-        assert not ib_db.delete_management_ip.called
+        assert infoblox.delete_object_by_ref.called
+        assert ib_db.delete_management_ip.called
 
 
 class CreateNetworkTestCase(base.BaseTestCase):
@@ -759,7 +769,7 @@ class CreateNetworkTestCase(base.BaseTestCase):
 
         c.create_network(context, network)
         infoblox.create_fixed_address_from_cidr.assert_called_once_with(
-            expected_net_view, expected_mac, cidr)
+            expected_net_view, expected_mac, cidr, mock.ANY)
 
     def test_stores_fixed_address_object_in_db(self):
         infoblox = mock.Mock()

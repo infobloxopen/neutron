@@ -79,7 +79,7 @@ class HostRecordAllocatorTestCase(base.BaseTestCase):
                                     mac, ip)
 
         ib_mock.create_host_record_for_given_ip.assert_called_once_with(
-            dnsview, zone_auth, hostname, mac, ip, None)
+            dnsview, zone_auth, hostname, mac, ip, mock.ANY)
 
     def test_creates_host_record_range_on_range_allocation(self):
         ib_mock = mock.MagicMock()
@@ -100,7 +100,7 @@ class HostRecordAllocatorTestCase(base.BaseTestCase):
 
         ib_mock.create_host_record_from_range.assert_called_once_with(
             dnsview, netview, zone_auth, hostname,
-            mac, first_ip, last_ip, None)
+            mac, first_ip, last_ip, mock.ANY)
 
     def test_deletes_host_record(self):
         ib_mock = mock.MagicMock()

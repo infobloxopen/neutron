@@ -45,9 +45,9 @@ OPTS = [
                         help=_("CIDR for the management network served by "
                                "Infoblox DHCP member")),
     neutron_conf.BoolOpt('allow_admin_network_deletion',
-                        default=False,
-                        help=_("Allow admin network which is global, "
-                               "external, or shared to be deleted"))
+                         default=False,
+                         help=_("Allow admin network which is global, "
+                                "external, or shared to be deleted"))
 ]
 
 neutron_conf.CONF.register_opts(OPTS)
@@ -83,6 +83,7 @@ class InfobloxIPAMController(neutron_ipam.NeutronIPAMController):
         cfg = self.config_finder.find_config_for_subnet(context, subnet)
         dhcp_members = cfg.reserve_dhcp_members()
         dns_members = cfg.reserve_dns_members()
+
         network = self._get_network(context, subnet['network_id'])
         create_infoblox_member = True
 
@@ -106,30 +107,31 @@ class InfobloxIPAMController(neutron_ipam.NeutronIPAMController):
         # DNS relay IP.
         nameservers = [item.ipv6 if subnet['ip_version'] == 6
                                  else item.ip for item in dns_members]
-        nameservers += user_nameservers
+
+        nameservers += [n for n in user_nameservers if n not in nameservers]
 
         nview_extattrs = self.ea_manager.get_extattrs_for_nview(context)
         network_extattrs = self.ea_manager.get_extattrs_for_network(
             context, subnet, network)
         range_extattrs = self.ea_manager.get_extattrs_for_range(
             context, network)
-        method_arguments = {'obj_manip': self.infoblox,
-                            'net_view_name': cfg.network_view,
-                            'dns_view_name': cfg.dns_view,
-                            'cidr': subnet['cidr'],
-                            'dhcp_member': dhcp_members,
-                            'gateway_ip': subnet['gateway_ip'],
-                            'disable': True,
-                            'nameservers': nameservers,
-                            'range_extattrs': range_extattrs,
-                            'network_extattrs': network_extattrs,
-                            'nview_extattrs': nview_extattrs,
-                            'related_members': set(cfg.dhcp_members +
-                                                   cfg.dns_members),
-                            'dhcp_trel_ip': infoblox_db.get_management_net_ip(
-                                context,
-                                subnet['network_id']),
-                            'ip_version': subnet['ip_version']}
+        method_arguments = {
+            'obj_manip':        self.infoblox,
+            'net_view_name':    cfg.network_view,
+            'dns_view_name':    cfg.dns_view,
+            'cidr':             subnet['cidr'],
+            'dhcp_member':      dhcp_members,
+            'gateway_ip':       subnet['gateway_ip'],
+            'disable':          True,
+            'nameservers':      nameservers,
+            'range_extattrs':   range_extattrs,
+            'network_extattrs': network_extattrs,
+            'nview_extattrs':   nview_extattrs,
+            'related_members':  set(cfg.dhcp_members + cfg.dns_members),
+            'dhcp_trel_ip':     infoblox_db.get_management_net_ip(
+                context, subnet['network_id']),
+            'ip_version':       subnet['ip_version']
+        }
 
         if subnet['ip_version'] == 6 and subnet['enable_dhcp']:
             if attributes.is_attr_set(subnet.get('ipv6_ra_mode')):
@@ -167,8 +169,8 @@ class InfobloxIPAMController(neutron_ipam.NeutronIPAMController):
         create_subnet_flow.add(tasks.CreateDNSViewTask())
 
         for ip_range in subnet['allocation_pools']:
-            # context.store is a global dict of method arguments for tasks in
-            # current flow, hence method arguments need to be rebound
+            # context.store is a global dict of method arguments for tasks
+            # in current flow, hence method arguments need to be rebound
             first = ip_range['start']
             last = ip_range['end']
             first_ip_arg = 'ip_range %s' % first
@@ -236,9 +238,12 @@ class InfobloxIPAMController(neutron_ipam.NeutronIPAMController):
             self.infoblox.delete_network(
                 cfg.network_view, cidr=subnet['cidr'])
 
-        if self._determine_member_deletion(context, cfg.network_view_scope,
-            subnet['id'], subnet['network_id'], subnet['tenant_id']):
-            cfg.member_manager.release_member(context, cfg.network_view)
+        if self._determine_member_deletion(context,
+                                           cfg.network_view_scope,
+                                           subnet['id'],
+                                           subnet['network_id'],
+                                           subnet['tenant_id']):
+            cfg.release_member(cfg.network_view)
 
         if cfg.require_dhcp_relay and \
             self.ib_db.is_last_subnet_in_network(context, subnet['id'],
@@ -262,18 +267,21 @@ class InfobloxIPAMController(neutron_ipam.NeutronIPAMController):
         if network_view_scope == 'static':
             return self.ib_db.is_last_subnet(context, subnet_id)
         if network_view_scope == 'tenant_id':
-            return self.ib_db.is_last_subnet_in_tenant(context, subnet_id,
+            return self.ib_db.is_last_subnet_in_tenant(context,
+                                                       subnet_id,
                                                        tenant_id)
         if network_view_scope == 'network_id':
-            return self.ib_db.is_last_subnet_in_network(context, subnet_id,
-                                                       network_id)
+            return self.ib_db.is_last_subnet_in_network(context,
+                                                        subnet_id,
+                                                        network_id)
         # In order to use network_name scope, a network name must be unique.
         # Openstack does not enforce this so user has to make sure that
         # each network name is unique when {network_name} pattern is used
         # for network view name. Then this is the same as network_id scope.
         if network_view_scope == 'network_name':
-            return self.ib_db.is_last_subnet_in_network(context, subnet_id,
-                                                       network_id)
+            return self.ib_db.is_last_subnet_in_network(context,
+                                                        subnet_id,
+                                                        network_id)
 
     def allocate_ip(self, context, subnet, port, ip=None):
         hostname = uuidutils.generate_uuid()
@@ -352,8 +360,7 @@ class InfobloxIPAMController(neutron_ipam.NeutronIPAMController):
                 LOG.debug("No domain-name-servers option found, it will"
                           "not be updated to the private IPAM relay IP.")
                 continue
-            if cfg.require_dhcp_relay:
-                net.update_member_ip_in_dns_nameservers(ip['ip_address'])
+            net.update_member_ip_in_dns_nameservers(ip['ip_address'])
             self.infoblox.update_network_options(net)
 
     def create_network(self, context, network):

@@ -20,8 +20,9 @@ from neutron.ipam.drivers.infoblox import exceptions
 
 
 class CreateNetViewTask(task.Task):
-    def execute(self, obj_manip, net_view_name, nview_extattrs):
-        obj_manip.create_network_view(net_view_name, nview_extattrs)
+    def execute(self, obj_manip, net_view_name, nview_extattrs, dhcp_member):
+        obj_manip.create_network_view(
+                        net_view_name, nview_extattrs, dhcp_member[0])
 
     def revert(self, obj_manip, net_view_name, **kwargs):
         if not obj_manip.has_networks(net_view_name):

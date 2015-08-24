@@ -18,6 +18,7 @@ import mock
 import taskflow.engines
 
 from neutron.common import constants as neutron_constants
+from neutron.db.infoblox import infoblox_db
 from neutron.ipam.drivers.infoblox import dns_controller
 from neutron.ipam.drivers.infoblox import infoblox_ipam
 from neutron.db.infoblox import infoblox_db
@@ -165,18 +166,17 @@ class DomainZoneTestCase(base.BaseTestCase):
 
         assert (manip.method_calls ==
                 [mock.call.create_dns_zone(mock.ANY,
-                                      mock.ANY,
-                                      expected_member,
-                                      mock.ANY,
-                                      zone_extattrs=mock.ANY),
+                                           mock.ANY,
+                                           expected_member,
+                                           mock.ANY,
+                                           zone_extattrs=mock.ANY),
                  mock.call.create_dns_zone(mock.ANY,
-                                      mock.ANY,
-                                      expected_member,
-                                      mock.ANY,
-                                      prefix=mock.ANY,
-                                      zone_extattrs=mock.ANY,
-                                      zone_format=mock.ANY)
-                 ])
+                                           mock.ANY,
+                                           expected_member,
+                                           mock.ANY,
+                                           prefix=mock.ANY,
+                                           zone_extattrs=mock.ANY,
+                                           zone_format=mock.ANY)])
 
     def test_secondary_dns_members(self):
         manip = mock.Mock()
@@ -207,18 +207,17 @@ class DomainZoneTestCase(base.BaseTestCase):
 
         assert (manip.method_calls ==
                 [mock.call.create_dns_zone(mock.ANY,
-                                      mock.ANY,
-                                      primary_dns_member,
-                                      secondary_dns_members,
-                                      zone_extattrs=mock.ANY),
+                                           mock.ANY,
+                                           primary_dns_member,
+                                           secondary_dns_members,
+                                           zone_extattrs=mock.ANY),
                  mock.call.create_dns_zone(mock.ANY,
-                                      mock.ANY,
-                                      primary_dns_member,
-                                      secondary_dns_members,
-                                      prefix=mock.ANY,
-                                      zone_extattrs=mock.ANY,
-                                      zone_format=mock.ANY)
-                 ])
+                                           mock.ANY,
+                                           primary_dns_member,
+                                           secondary_dns_members,
+                                           prefix=mock.ANY,
+                                           zone_extattrs=mock.ANY,
+                                           zone_format=mock.ANY)])
 
     def test_prefix_for_classless_networks(self):
         manip = mock.Mock()
@@ -246,18 +245,17 @@ class DomainZoneTestCase(base.BaseTestCase):
 
         assert (manip.method_calls ==
                 [mock.call.create_dns_zone(mock.ANY,
-                                      mock.ANY,
-                                      mock.ANY,
-                                      mock.ANY,
-                                      zone_extattrs=mock.ANY),
+                                           mock.ANY,
+                                           mock.ANY,
+                                           mock.ANY,
+                                           zone_extattrs=mock.ANY),
                  mock.call.create_dns_zone(mock.ANY,
-                                      mock.ANY,
-                                      mock.ANY,
-                                      mock.ANY,
-                                      prefix=subnet['name'],
-                                      zone_extattrs=mock.ANY,
-                                      zone_format=mock.ANY)
-                 ])
+                                           mock.ANY,
+                                           mock.ANY,
+                                           mock.ANY,
+                                           prefix=subnet['name'],
+                                           zone_extattrs=mock.ANY,
+                                           zone_format=mock.ANY)])
 
     def test_prefix_for_classfull_networks(self):
         manip = mock.Mock()

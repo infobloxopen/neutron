@@ -59,11 +59,8 @@ class InfobloxIPAM(neutron_ipam.NeutronIPAM):
     def create_subnet(self, context, subnet):
         context = FlowContext(context, 'create-subnet')
         context.store['subnet'] = subnet
-
         retval = super(InfobloxIPAM, self).create_subnet(context, subnet)
-
         taskflow.engines.run(context.parent_flow, store=context.store)
-
         return retval
 
     def _collect_members_ips(self, context, network, model):

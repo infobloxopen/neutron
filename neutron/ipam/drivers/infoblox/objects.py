@@ -38,12 +38,14 @@ def is_valid_ip(ip):
         return False
     return True
 
+
 def generate_duid(mac):
-    duid = [ 0x00,
+    duid = [0x00,
             random.randint(0x00, 0x7f),
             random.randint(0x00, 0xff),
-            random.randint(0x00, 0xff) ]
+            random.randint(0x00, 0xff)]
     return ':'.join(map(lambda x: "%02x" % x, duid)) + ':' + mac
+
 
 class Network(object):
     """Sample Infoblox 'network' object in JSON format:
@@ -149,14 +151,17 @@ class Network(object):
                 return True
         return False
 
+    def _is_member_ip(self, ip):
+        return ip in self.member_ip_addrs
+
     def update_member_ip_in_dns_nameservers(self, relay_ip):
         for opt in self.options:
             if self._is_dns_option(opt):
                 original_value = opt['value'].split(',')
-                original_value.append(relay_ip)
-                original_value = set(list(original_value))
+                original_value.insert(0, relay_ip)
                 opt['value'] = ",".join(
-                    [val for val in original_value if val])
+                    [val for val in original_value
+                        if val and not self._is_member_ip(val)])
 
                 return
 
@@ -309,7 +314,8 @@ class HostRecordIPv4(HostRecord):
         u'ipv4addrs': [
             {
                 u'configure_for_dhcp': False,
-                u'_ref': u'record:host_ipv4addr/lMmQ3ZjkuMmM4ZjhlOTctMGQ5Mi00Y2:22.0.0.2/test_host_name.testsubnet.cloud.global.com/default', u'ipv4addr': u'22.0.0.2',
+                u'_ref': u'record:host_ipv4addr/lMmQ3ZjkuMmM4ZjhlOTctMGQ5Mi00Y2:22.0.0.2/
+                         test_host_name.testsubnet.cloud.global.com/default', u'ipv4addr': u'22.0.0.2',
                 u'mac': u'fa:16:3e:29:87:70',
                 u'host': u'2c8f8e97-0d92-4cac-a350-09a0c53fe664.33c00d42-9715-43fe-862c-6ff2b7e2d7f9.cloud.global.com'
             }
@@ -319,7 +325,7 @@ class HostRecordIPv4(HostRecord):
             u'Cloud API Owned': {u'value': u'True'},
             u'VM ID': {u'value': u'None'},
             u'IP Type': {u'value': u'Fixed'},
-            u'CMP Type': {u'value': u'openstack'},
+            u'CMP Type': {u'value': u'OpenStack'},
             u'Port ID': {u'value': u'136ef9ad-9c88-41ea-9fa6-bd48d8ec789a'},
             u'Tenant ID': {u'value': u'00fd80791dee4112bb538c872b206d4c'}
         }
@@ -431,20 +437,21 @@ class HostRecordIPv6(HostRecord):
         u'_ref': u'record:host/ZG5zLmhvc3QkLl9kZWZhdWx0LmNvbS5nbG9iYWwuYMQ
                    :test_host_name.testsubnet.cloud.global.com/default',
         u'ipv6addrs': [
-                {
-                    u'configure_for_dhcp': False,
-                    u'_ref': u'record:host_ipv6addr/ZG5zLmhvc3RfYWRkcmV:2607%3Af0d0%3A1002%3A51%3A%3A2/test_host_name.testsubnet/default',
-                    u'host': u'ea30c45d-6385-44a2-b187-94b0c6f8bad1.9706dd0c-b772-4522-93e3-2e4fea2859de.cloud.global.com',
-                    u'duid': u'00:6f:6d:ba:fa:16:3e:86:40:e3',
-                    u'ipv6addr': u'2607:f0d0:1002:51::2'
-                }
+            {
+                u'configure_for_dhcp': False,
+                u'_ref': u'record:host_ipv6addr/ZG5zLmhvc3RfYWRkcmV:2607%3Af0d0%3A1002%3A51%3A%3A2/
+                         test_host_name.testsubnet/default',
+                u'host': u'ea30c45d-6385-44a2-b187-94b0c6f8bad1.9706dd0c-b772-4522-93e3-2e4fea2859de.cloud.global.com',
+                u'duid': u'00:6f:6d:ba:fa:16:3e:86:40:e3',
+                u'ipv6addr': u'2607:f0d0:1002:51::2'
+            }
         ],
         u'extattrs': {
                         u'Account': {u'value': u'8a21c40495f04f30a1b2dc6fd1d9ed1a'},
                         u'Port ID': {u'value': u'77c2ee08-32bf-4cd6-a24f-586ca91bd533'},
                         u'VM ID': {u'value': u'None'},
                         u'IP Type': {u'value': u'Fixed'},
-                        u'CMP Type': {u'value': u'openstack'},
+                        u'CMP Type': {u'value': u'OpenStack'},
                         u'Cloud API Owned': {u'value': u'True'},
                         u'Tenant ID': {u'value': u'00fd80791dee4112bb538c872b206d4c'}
                      }
@@ -621,16 +628,36 @@ class FixedAddressIPv6(FixedAddress):
 
 
 class Member(object):
-    def __init__(self, ip, name, ipv6=None):
+    def __init__(self, ip, name, ipv6=None, map_id=None, delegate=False):
         self.ip = ip
         self.ipv6 = ipv6
         self.name = name
+        self.map_id = map_id
+        self.delegate = delegate
 
     def __eq__(self, other):
-        return self.ip == other.ip and self.name == other.name
+        return self.ip == other.ip and \
+            self.name == other.name and \
+            self.map_id == other.map_id
 
     def __repr__(self):
-        return 'Member(IP={ip}, IPv6={ipv6}, name={name})'.format(
-            ip=self.ip,
-            ipv6=self.ipv6,
-            name=self.name)
+        return \
+            ('Member(IP={ip}, IPv6={ipv6}, name={name}, map_id={map_id}, ' +
+            'delegate={delegate})').\
+            format(ip=self.ip,
+                   ipv6=self.ipv6,
+                   name=self.name,
+                   map_id=self.map_id,
+                   delegate=self.delegate)
+
+    @property
+    def specifier(self):
+        """Return _struct dhcpmember that can be used to specify a member"""
+        specifier = {'_struct': 'dhcpmember'}
+        if self.name:
+            specifier['name'] = self.name
+        elif self.ip:
+            specifier['ipv4addr'] = self.ip
+        elif self.ipv6:
+            specifier['ipv6addr'] = self.ipv6
+        return specifier

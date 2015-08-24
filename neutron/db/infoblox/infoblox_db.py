@@ -16,43 +16,132 @@
 from oslo.config import cfg
 from sqlalchemy.orm import exc
 
+import functools
+import time
+
+from oslo.config import cfg
 from neutron.db import external_net_db
 from neutron.db.infoblox import models
 from neutron.db import l3_db
 from neutron.db import models_v2
 from neutron.openstack.common import log as logging
+#from neutron.openstack.common.db import exception as db_exc
+from oslo.db import exception as db_exc
+
+
+OPTS = [
+    cfg.IntOpt('infoblox_db_retry_interval',
+               default=5,
+               help=_('Seconds between db connection retries')),
+    cfg.IntOpt('infoblox_db_max_try',
+               default=20,
+               help=_('Maximum retries before error is raised. '
+                      '(setting -1 implies an infinite retry count)')),
+    cfg.BoolOpt('infoblox_db_inc_retry_interval',
+                default=True,
+                help=_('Whether to increase interval between retries, '
+                       'up to infoblox_db_max_retry_interval')),
+    cfg.IntOpt('infoblox_db_max_retry_interval',
+               default=600,
+               help='Max seconds for total retries, if '
+                    'infoblox_db_inc_retry_interval is enabled')
+]
+
+cfg.CONF.register_opts(OPTS)
 
 LOG = logging.getLogger(__name__)
 
 
+def _retry_db_error(func):
+    @functools.wraps(func)
+    def callee(*args, **kwargs):
+        next_interval = cfg.CONF.infoblox_db_retry_interval
+        remaining = cfg.CONF.infoblox_db_max_try
+        while True:
+            try:
+                return func(*args, **kwargs)
+            except Exception as e:
+                LOG.warn(_("DB error on %s: %s"
+                           % (func, str(e))))
+                if remaining == 0:
+                    LOG.exception(_('DB exceeded retry limit.'))
+                    raise db_exc.DBError(e)
+                if remaining != -1:
+                    remaining -= 1
+                time.sleep(next_interval)
+                if cfg.CONF.infoblox_db_inc_retry_interval:
+                    next_interval = min(
+                        next_interval * 2,
+                        cfg.CONF.infoblox_db_max_retry_interval
+                    )
+    return callee
+
+
 def get_used_members(context, member_type):
-    """Returns used names of members."""
-    query = context.session.query(models.InfobloxMemberMap.member_name)
-    members = query.filter_by(member_type=member_type).distinct()
-    return [m.member_name for m in members]
+    """Returns used members where map_id is not null."""
+    q = context.session.query(models.InfobloxMemberMap)
+    members = q.filter(models.InfobloxMemberMap.member_type ==
+                       member_type).\
+        filter(models.InfobloxMemberMap.map_id.isnot(None)).\
+        distinct()
+    return members
+
+
+def get_registered_members(context, member_type):
+    """Returns registered members."""
+    q = context.session.query(models.InfobloxMemberMap)
+    members = q.filter_by(member_type=member_type).distinct()
+    return members
+
+
+@_retry_db_error
+def get_available_member(context, member_type):
+    """Returns available members."""
+    q = context.session.query(models.InfobloxMemberMap)
+    q = q.filter(models.InfobloxMemberMap.member_type == member_type)
+    member = q.filter(models.InfobloxMemberMap.map_id.is_(None)).\
+        with_lockmode("update").\
+        first()
+    return member
 
 
 def get_members(context, map_id, member_type):
-    """Returns names of members used by currently used mapping (tenant id,
+    """Returns members used by currently used mapping (tenant id,
     network id or Infoblox netview name).
     """
     q = context.session.query(models.InfobloxMemberMap)
     members = q.filter_by(map_id=map_id, member_type=member_type).all()
-    if members:
-        return [member.member_name for member in members]
-    return None
+    return members
+
+
+def register_member(context, map_id, member_name, member_type):
+    if map_id:
+        context.session.add(
+            models.InfobloxMemberMap(map_id=map_id,
+                                     member_name=member_name,
+                                     member_type=member_type))
+    else:
+        context.session.add(
+            models.InfobloxMemberMap(member_name=member_name,
+                                     member_type=member_type))
 
 
 def attach_member(context, map_id, member_name, member_type):
-    context.session.add(models.InfobloxMemberMap(map_id=map_id,
-                                                 member_name=member_name,
-                                                 member_type=member_type))
+    context.session.query(models.InfobloxMemberMap.member_name).\
+        filter_by(member_name=member_name, member_type=member_type).\
+        update({'map_id': map_id})
 
 
 def delete_members(context, map_id):
     with context.session.begin(subtransactions=True):
         context.session.query(
             models.InfobloxMemberMap).filter_by(map_id=map_id).delete()
+
+
+@_retry_db_error
+def release_member(context, map_id):
+    context.session.query(models.InfobloxMemberMap.member_name).\
+        filter_by(map_id=map_id).update({'map_id': None})
 
 
 def is_last_subnet(context, subnet_id):
@@ -73,7 +162,8 @@ def is_last_subnet_in_tenant(context, subnet_id, tenant_id):
 
 
 def is_last_subnet_in_private_networks(context, subnet_id):
-    sub_qry = context.session.query(external_net_db.ExternalNetwork.network_id)
+    sub_qry = context.session.query(
+        external_net_db.ExternalNetwork.network_id)
     q = context.session.query(models_v2.Subnet.id)
     q = q.filter(models_v2.Subnet.id != subnet_id)
     q = q.filter(~models_v2.Subnet.network_id.in_(sub_qry))
@@ -110,7 +200,9 @@ def get_subnets_by_port(context, port_id):
     subnets = []
     subnet_qry = context.session.query(models_v2.Subnet)
     for allocation in allocs:
-        subnets.append(subnet_qry.filter_by(id=allocation.subnet_id).first())
+        subnets.append(subnet_qry.
+                       filter_by(id=allocation.subnet_id).
+                       first())
     return subnets
 
 

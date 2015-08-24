@@ -39,7 +39,7 @@ def upgrade(active_plugins=None, options=None):
     op.create_table(
         'infoblox_member_maps',
         sa.Column('member_name', sa.String(255), nullable=False),
-        sa.Column('map_id', sa.String(255), nullable=False))
+        sa.Column('map_id', sa.String(255), nullable=True))
 
 
 def downgrade(active_plugins=None, options=None):

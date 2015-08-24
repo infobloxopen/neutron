@@ -60,7 +60,8 @@ def get_subnets_by_port_id(context, port_id):
 def get_subnet_ports(context, subnet_id):
     # Check if any tenant owned ports are using this subnet
     ports_qry = context.session.query(models_v2.Port).join(
-        models_v2.IPAllocation).with_lockmode('update')
+        models_v2.IPAllocation).with_lockmode(
+        'update').enable_eagerloads(False)
     ports = ports_qry.filter_by(subnet_id=subnet_id)
     return ports
 

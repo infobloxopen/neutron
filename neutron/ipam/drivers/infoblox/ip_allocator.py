@@ -86,12 +86,7 @@ class HostRecordIPAllocator(IPAllocator):
         reserved_ip_hr = self.infoblox.get_host_record(dnsview_name, ip)
 
         if reserved_hostname_hr == reserved_ip_hr:
-            if extattrs.get('Port Attached Device - Device Owner').\
-                get('value') == neutron_constants.DEVICE_OWNER_FLOATINGIP:
-                self.infoblox.update_host_record_eas(dnsview_name,
-                                                     ip, extattrs)
             return
-
         if reserved_hostname_hr:
             for hr_ip in reserved_ip_hr.ips:
                 if hr_ip == ip:
@@ -142,7 +137,7 @@ class FixedAddressIPAllocator(IPAllocator):
     def bind_names(self, netview_name, dnsview_name, ip, name, extattrs):
         bind_cfg = cfg.CONF.bind_dns_records_to_fixed_address
         if extattrs.get('Port Attached Device - Device Owner').\
-            get('value') == neutron_constants.DEVICE_OWNER_FLOATINGIP:
+                get('value') == neutron_constants.DEVICE_OWNER_FLOATINGIP:
             self.infoblox.update_fixed_address_eas(netview_name, ip,
                                                    extattrs)
             self.infoblox.update_dns_record_eas(dnsview_name, ip,

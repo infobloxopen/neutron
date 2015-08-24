@@ -52,7 +52,7 @@ class InfobloxMemberMap(model_base.BASEV2):
     __tablename__ = 'infoblox_member_maps'
 
     member_name = sa.Column(sa.String(255), nullable=False, primary_key=True)
-    map_id = sa.Column(sa.String(255), nullable=False)
+    map_id = sa.Column(sa.String(255), nullable=True)
     member_type = sa.Column(sa.String(10))
 
 

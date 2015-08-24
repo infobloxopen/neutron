@@ -143,7 +143,8 @@ class InfobloxEaManager(object):
         os_instance_name = None
 
         set_os_instance_id = ((not ignore_instance_id) and
-            (port['device_owner'] not in neutron_internal_services_dev_owners))
+                              (port['device_owner'] not in
+                               neutron_internal_services_dev_owners))
 
         if set_os_instance_id:
             # for floating ip, no instance id exists
@@ -199,7 +200,7 @@ class InfobloxEaManager(object):
         else:
             os_network_is_shared = False
 
-        os_cloud_owned = not (os_network_is_shared or os_network_is_shared)
+        os_cloud_owned = not (os_network_is_external or os_network_is_shared)
         attributes = {
             'Is External': os_network_is_external,
             'Is Shared': os_network_is_shared,
@@ -218,7 +219,8 @@ class InfobloxEaManager(object):
 
         return os_instance_id
 
-    def _to_str_or_none(self, value):
+    @staticmethod
+    def _to_str_or_none(value):
         retval = None
         if not isinstance(value, basestring):
             if value is not None:
@@ -239,7 +241,7 @@ class InfobloxEaManager(object):
 
     @classmethod
     def add_openstack_extattrs_marker(cls, extattrs):
-        extattrs[cls.OPENSTACK_OBJECT_FLAG] = {'value': 'openstack'}
+        extattrs[cls.OPENSTACK_OBJECT_FLAG] = {'value': 'OpenStack'}
 
 
 def _construct_extattrs(filters):

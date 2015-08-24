@@ -346,7 +346,8 @@ class NeutronIPAM(base.IPAMManager):
             subnet_ports = self.db_manager.get_subnet_ports(context, subnet_id)
 
             ports_to_remove = [port for port in subnet_ports if
-                neutron_db.get_subnets_by_port_id(context, port.id) <= 1]
+                               neutron_db.get_subnets_by_port_id(
+                                   context, port.id) <= 1]
 
             has_ports_allocated = not all(
                 p.device_owner == constants.DEVICE_OWNER_DHCP

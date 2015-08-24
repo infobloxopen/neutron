@@ -76,6 +76,9 @@ PRIORITY_RPC = 0
 PRIORITY_SYNC_ROUTERS_TASK = 1
 DELETE_ROUTER = 1
 
+# Access with redirection to metadata proxy iptables mark mask
+METADATA_ACCESS_MARK_MASK = '0xffffffff'
+
 
 class L3PluginApi(n_rpc.RpcProxy):
     """Agent side of the l3 agent RPC API.
@@ -493,6 +496,10 @@ class L3NATAgent(firewall_l3_agent.FWaaSL3AgentRpcCallback,
                     help=_("Allow running metadata proxy.")),
         cfg.BoolOpt('router_delete_namespaces', default=False,
                     help=_("Delete namespace after removing a router.")),
+        cfg.StrOpt('metadata_access_mark',
+                   default='0x1',
+                   help=_('Iptables mangle mark used to mark metadata valid '
+                          'requests')),
         cfg.StrOpt('metadata_proxy_socket',
                    default='$state_path/metadata_proxy',
                    help=_('Location of Metadata Proxy UNIX domain '
@@ -762,6 +769,8 @@ class L3NATAgent(firewall_l3_agent.FWaaSL3AgentRpcCallback,
             self._create_router_namespace(ri)
         for c, r in self.metadata_filter_rules():
             ri.iptables_manager.ipv4['filter'].add_rule(c, r)
+        for c, r in self.metadata_mangle_rules():
+            ri.iptables_manager.ipv4['mangle'].add_rule(c, r)
         for c, r in self.metadata_nat_rules():
             ri.iptables_manager.ipv4['nat'].add_rule(c, r)
         ri.iptables_manager.apply()
@@ -792,6 +801,8 @@ class L3NATAgent(firewall_l3_agent.FWaaSL3AgentRpcCallback,
         self.process_router(ri)
         for c, r in self.metadata_filter_rules():
             ri.iptables_manager.ipv4['filter'].remove_rule(c, r)
+        for c, r in self.metadata_mangle_rules():
+            ri.iptables_manager.ipv4['mangle'].remove_rule(c, r)
         for c, r in self.metadata_nat_rules():
             ri.iptables_manager.ipv4['nat'].remove_rule(c, r)
         ri.iptables_manager.apply()
@@ -1452,19 +1463,32 @@ class L3NATAgent(firewall_l3_agent.FWaaSL3AgentRpcCallback,
             self._destroy_snat_namespace(ns_name)
 
     def metadata_filter_rules(self):
+        if self.conf.enable_metadata_proxy:
+            return [('INPUT', '-m mark --mark %s -j ACCEPT' %
+                     self.conf.metadata_access_mark),
+                    ('INPUT', '-s 0.0.0.0/0 -p tcp -m tcp --dport %s '
+                     '-j DROP' % self.conf.metadata_port)]
+        return []
+
+    def metadata_mangle_rules(self):
         rules = []
         if self.conf.enable_metadata_proxy:
-            rules.append(('INPUT', '-s 0.0.0.0/0 -d 127.0.0.1 '
-                          '-p tcp -m tcp --dport %s '
-                          '-j ACCEPT' % self.conf.metadata_port))
+            rules.append(('PREROUTING', '-s 0.0.0.0/0 -d 169.254.169.254/32 '
+                          '-p tcp -m tcp --dport 80 '
+                          '-j MARK --set-xmark %(value)s/%(mask)s' %
+                          {'value': self.conf.metadata_access_mark,
+                           'mask': METADATA_ACCESS_MARK_MASK}))
         return rules
 
     def metadata_nat_rules(self):
         rules = []
         if self.conf.enable_metadata_proxy:
             rules.append(('PREROUTING', '-s 0.0.0.0/0 -d 169.254.169.254/32 '
+                          '-i %(interface_name)s '
                           '-p tcp -m tcp --dport 80 -j REDIRECT '
-                          '--to-port %s' % self.conf.metadata_port))
+                          '--to-port %(port)s' %
+                          {'interface_name': INTERNAL_DEV_PREFIX + '+',
+                           'port': self.conf.metadata_port}))
         return rules
 
     def external_gateway_nat_rules(self, ex_gw_ip, internal_cidrs,
@@ -1940,6 +1964,11 @@ class L3NATAgent(firewall_l3_agent.FWaaSL3AgentRpcCallback,
                 self._cleanup_namespaces(namespaces, ids_to_keep)
 
     def after_start(self):
+        # Note: the FWaaS' vArmourL3NATAgent is a subclass of L3NATAgent. It
+        # calls this method here. So Removing this after_start() would break
+        # vArmourL3NATAgent. We need to find out whether vArmourL3NATAgent
+        # can have L3NATAgentWithStateReport as its base class instead of
+        # L3NATAgent.
         eventlet.spawn_n(self._process_routers_loop)
         LOG.info(_("L3 agent started"))
         # When L3 agent is ready, we immediately do a full sync
@@ -1978,6 +2007,7 @@ class L3NATAgent(firewall_l3_agent.FWaaSL3AgentRpcCallback,
 class L3NATAgentWithStateReport(L3NATAgent):
 
     def __init__(self, host, conf=None):
+        self.use_call = True
         super(L3NATAgentWithStateReport, self).__init__(host=host, conf=conf)
         self.state_rpc = agent_rpc.PluginReportStateAPI(topics.PLUGIN)
         self.agent_state = {
@@ -1997,7 +2027,6 @@ class L3NATAgentWithStateReport(L3NATAgent):
             'start_flag': True,
             'agent_type': l3_constants.AGENT_TYPE_L3}
         report_interval = cfg.CONF.AGENT.report_interval
-        self.use_call = True
         if report_interval:
             self.heartbeat = loopingcall.FixedIntervalLoopingCall(
                 self._report_state)
@@ -2037,6 +2066,15 @@ class L3NATAgentWithStateReport(L3NATAgent):
             return
         except Exception:
             LOG.exception(_("Failed reporting state!"))
+
+    def after_start(self):
+        eventlet.spawn_n(self._process_routers_loop)
+        LOG.info(_("L3 agent started"))
+        # Do the report state before we do the first full sync.
+        self._report_state()
+
+        # When L3 agent is ready, we immediately do a full sync
+        self.periodic_sync_routers_task(self.context)
 
     def agent_updated(self, context, payload):
         """Handle the agent_updated notification event."""

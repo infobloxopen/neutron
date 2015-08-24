@@ -21,6 +21,7 @@ from oslo.config import cfg
 
 from neutron.common import constants as n_const
 from neutron.openstack.common import log as logging
+from neutron.plugins.common import constants as p_const
 from neutron.plugins.ml2.common import exceptions as ml2_exc
 from neutron.plugins.ml2 import driver_api
 from neutron.plugins.ml2.drivers.arista import config  # noqa
@@ -45,7 +46,6 @@ class AristaRPCWrapper(object):
         self.keystone_conf = cfg.CONF.keystone_authtoken
         self.region = cfg.CONF.ml2_arista.region_name
         self.sync_interval = cfg.CONF.ml2_arista.sync_interval
-        self._region_updated_time = None
         # The cli_commands dict stores the mapping between the CLI command key
         # and the actual CLI command.
         self.cli_commands = {}
@@ -199,18 +199,6 @@ class AristaRPCWrapper(object):
                 'no dhcp id %s port-id %s' % (dhcp_id, port_id),
                 'exit']
         self._run_openstack_cmds(cmds)
-
-    def sync_start(self):
-        """Sends indication to EOS that ML2->EOS sync has started."""
-
-        sync_start_cmd = ['sync start']
-        self._run_openstack_cmds(sync_start_cmd)
-
-    def sync_end(self):
-        """Sends indication to EOS that ML2->EOS sync has completed."""
-
-        sync_end_cmd = ['sync end']
-        self._run_openstack_cmds(sync_end_cmd)
 
     def create_network(self, tenant_id, network):
         """Creates a single network on Arista hardware
@@ -411,17 +399,9 @@ class AristaRPCWrapper(object):
         self._run_openstack_cmds(cmds, commands_to_log=log_cmds)
 
     def clear_region_updated_time(self):
-        """Clear the region updated time which forces a resync."""
-
-        self._region_updated_time = None
-
-    def region_in_sync(self):
-        """Check whether EOS is in sync with Neutron."""
-
-        eos_region_updated_times = self.get_region_updated_time()
-        return (self._region_updated_time and
-               (self._region_updated_time['regionTimestamp'] ==
-                eos_region_updated_times['regionTimestamp']))
+        # TODO(shashank): Remove this once the call is removed from the ML2
+        # driver.
+        pass
 
     def get_region_updated_time(self):
         """Return the timestamp of the last update.
@@ -498,7 +478,6 @@ class AristaRPCWrapper(object):
         full_command.extend(self._get_exit_mode_cmds(['region',
                                                       'openstack',
                                                       'cvx']))
-        full_command.extend(self.cli_commands['timestamp'])
         return full_command
 
     def _run_openstack_cmds(self, commands, commands_to_log=None):
@@ -518,11 +497,7 @@ class AristaRPCWrapper(object):
             full_log_command = self._build_command(commands_to_log)
         else:
             full_log_command = None
-        ret = self._run_eos_cmds(full_command, full_log_command)
-        # Remove return values for 'configure terminal',
-        # 'service openstack' and 'exit' commands
-        if self.cli_commands['timestamp']:
-            self._region_updated_time = ret[-1]
+        self._run_eos_cmds(full_command, full_log_command)
 
     def _eapi_host_url(self):
         self._validate_config()
@@ -557,41 +532,37 @@ class SyncService(object):
         self._rpc = rpc_wrapper
         self._ndb = neutron_db
         self._force_sync = True
+        self._region_updated_time = None
+
+    def force_sync(self):
+        """Sets the force_sync flag."""
+        self._force_sync = True
 
     def do_synchronize(self):
-        try:
-            # Send trigger to EOS that the ML2->EOS sync has started.
-            self._rpc.sync_start()
-            LOG.info(_('Sync start trigger sent to EOS'))
-        except arista_exc.AristaRpcError:
-            LOG.warning(EOS_UNREACHABLE_MSG)
+        """Periodically check whether EOS is in sync with ML2 driver.
+
+           If ML2 database is not in sync with EOS, then compute the diff and
+           send it down to EOS.
+        """
+        if not self._sync_required():
             return
 
-        # Perform the sync
-        self.synchronize()
+        # Send 'sync start' marker.
+        if not self._sync_start():
+            return
 
-        try:
-            # Send trigger to EOS that the ML2->EOS sync is Complete.
-            self._rpc.sync_end()
-        except arista_exc.AristaRpcError:
-            LOG.warning(EOS_UNREACHABLE_MSG)
+        # Perform the actual synchronization.
+        self.synchronize()
+        # Send 'sync end' marker.
+        if not self._sync_end():
+            return
+
+        self._set_region_updated_time()
 
     def synchronize(self):
         """Sends data to EOS which differs from neutron DB."""
 
         LOG.info(_('Syncing Neutron <-> EOS'))
-        try:
-            # Get the time at which entities in the region were updated.
-            # If the times match, then ML2 is in sync with EOS. Otherwise
-            # perform a complete sync.
-            if not self._force_sync and self._rpc.region_in_sync():
-                LOG.info(_('OpenStack and EOS are in sync!'))
-                return
-        except arista_exc.AristaRpcError:
-            LOG.warning(EOS_UNREACHABLE_MSG)
-            self._force_sync = True
-            return
-
         try:
             #Always register with EOS to ensure that it has correct credentials
             self._rpc.register_with_eos()
@@ -602,24 +573,6 @@ class SyncService(object):
             return
 
         db_tenants = db.get_tenants()
-
-        if not db_tenants and eos_tenants:
-            # No tenants configured in Neutron. Clear all EOS state
-            try:
-                self._rpc.delete_this_region()
-                msg = _('No Tenants configured in Neutron DB. But %d '
-                        'tenants discovered in EOS during synchronization.'
-                        'Entire EOS region is cleared') % len(eos_tenants)
-                LOG.info(msg)
-                # Re-register with EOS so that the timestamp is updated.
-                self._rpc.register_with_eos()
-                # Region has been completely cleaned. So there is nothing to
-                # synchronize
-                self._force_sync = False
-            except arista_exc.AristaRpcError:
-                LOG.warning(EOS_UNREACHABLE_MSG)
-                self._force_sync = True
-            return
 
         # Delete tenants that are in EOS, but not in the database
         tenants_to_delete = frozenset(eos_tenants.keys()).difference(
@@ -637,6 +590,7 @@ class SyncService(object):
         # operations fail, then force_sync is set to true
         self._force_sync = False
 
+        vms_to_update = {}
         for tenant in db_tenants:
             db_nets = db.get_networks(tenant)
             db_vms = db.get_vms(tenant)
@@ -658,7 +612,7 @@ class SyncService(object):
             nets_to_update = db_nets_key_set.difference(eos_nets_key_set)
 
             # Find the VMs that are present in Neutron DB, but not on EOS
-            vms_to_update = db_vms_key_set.difference(eos_vms_key_set)
+            vms_to_update[tenant] = db_vms_key_set.difference(eos_vms_key_set)
 
             try:
                 if vms_to_delete:
@@ -672,26 +626,90 @@ class SyncService(object):
                         self._ndb.get_all_networks_for_tenant(tenant)
                     )
 
-                    networks = [
-                        {'network_id': net_id,
-                         'segmentation_id':
+                    networks = [{
+                        'network_id': net_id,
+                        'segmentation_id':
                             db_nets[net_id]['segmentationTypeId'],
-                         'network_name':
-                            neutron_nets.get(net_id, {'name': ''})['name'], }
+                        'network_name':
+                            neutron_nets.get(net_id, {'name': ''})['name'],
+                    }
                         for net_id in nets_to_update
                     ]
                     self._rpc.create_network_bulk(tenant, networks)
-                if vms_to_update:
-                    # Filter the ports to only the vms that we are interested
-                    # in.
-                    vm_ports = [
-                        port for port in self._ndb.get_all_ports_for_tenant(
-                            tenant) if port['device_id'] in vms_to_update
-                    ]
+            except arista_exc.AristaRpcError:
+                LOG.warning(EOS_UNREACHABLE_MSG)
+                self._force_sync = True
+
+        # Now update the VMs
+        for tenant in vms_to_update:
+            if not vms_to_update[tenant]:
+                continue
+            try:
+                # Filter the ports to only the vms that we are interested
+                # in.
+                vm_ports = [
+                    port for port in self._ndb.get_all_ports_for_tenant(
+                        tenant) if port['device_id'] in vms_to_update[tenant]
+                ]
+                if vm_ports:
+                    db_vms = db.get_vms(tenant)
                     self._rpc.create_vm_port_bulk(tenant, vm_ports, db_vms)
             except arista_exc.AristaRpcError:
                 LOG.warning(EOS_UNREACHABLE_MSG)
                 self._force_sync = True
+
+    def _sync_start(self):
+        """Let EOS know that a sync in being initiated."""
+        try:
+            self._rpc._run_openstack_cmds(['sync start'])
+            return True
+        except arista_exc.AristaRpcError:
+            self._force_sync = True
+            return False
+
+    def _sync_end(self):
+        """Let EOS know that sync is complete."""
+        try:
+            self._rpc._run_openstack_cmds(['sync end'])
+            return True
+        except arista_exc.AristaRpcError:
+            self._force_sync = True
+            return False
+
+    def _region_in_sync(self):
+        """Checks if the region is in sync with EOS.
+
+           Checks whether the timestamp stored in EOS is the same as the
+           timestamp stored locally.
+        """
+        eos_region_updated_times = self._rpc.get_region_updated_time()
+        return (self._region_updated_time and
+                (self._region_updated_time['regionTimestamp'] ==
+                 eos_region_updated_times['regionTimestamp']))
+
+    def _sync_required(self):
+        """"Check whether the sync is required."""
+        try:
+            # Get the time at which entities in the region were updated.
+            # If the times match, then ML2 is in sync with EOS. Otherwise
+            # perform a complete sync.
+            if not self._force_sync and self._region_in_sync():
+                LOG.info(_('OpenStack and EOS are in sync!'))
+                self._sync_end()
+                return False
+        except arista_exc.AristaRpcError:
+            LOG.warning(EOS_UNREACHABLE_MSG)
+            # Force an update incase of an error.
+            self._force_sync = True
+        return True
+
+    def _set_region_updated_time(self):
+        """Get the region updated time from EOS and store it locally."""
+        try:
+            self._region_updated_time = self._rpc.get_region_updated_time()
+        except arista_exc.AristaRpcError:
+            # Force an update incase of an error.
+            self._force_sync = True
 
     def _get_eos_networks(self, eos_tenants, tenant):
         networks = {}
@@ -742,8 +760,13 @@ class AristaDriver(driver_api.MechanismDriver):
 
         network = context.current
         segments = context.network_segments
+        if segments[0][driver_api.NETWORK_TYPE] != p_const.TYPE_VLAN:
+            # If network type is not VLAN, do nothing
+            return
         network_id = network['id']
         tenant_id = network['tenant_id']
+        if not tenant_id:
+            tenant_id = context._plugin_context.tenant_id
         segmentation_id = segments[0]['segmentation_id']
         with self.eos_sync_lock:
             db.remember_tenant(tenant_id)
@@ -758,6 +781,8 @@ class AristaDriver(driver_api.MechanismDriver):
         network_id = network['id']
         network_name = network['name']
         tenant_id = network['tenant_id']
+        if not tenant_id:
+            tenant_id = context._plugin_context.tenant_id
         segments = context.network_segments
         vlan_id = segments[0]['segmentation_id']
         with self.eos_sync_lock:
@@ -766,7 +791,8 @@ class AristaDriver(driver_api.MechanismDriver):
                     network_dict = {
                         'network_id': network_id,
                         'segmentation_id': vlan_id,
-                        'network_name': network_name}
+                        'network_name': network_name,
+                    }
                     self.rpc.create_network(tenant_id, network_dict)
                 except arista_exc.AristaRpcError:
                     LOG.info(EOS_UNREACHABLE_MSG)
@@ -797,10 +823,12 @@ class AristaDriver(driver_api.MechanismDriver):
         """
         new_network = context.current
         orig_network = context.original
-        if new_network['name'] != orig_network['name']:
+        if(new_network['name'] != orig_network['name']):
             network_id = new_network['id']
             network_name = new_network['name']
             tenant_id = new_network['tenant_id']
+            if not tenant_id:
+                tenant_id = context._plugin_context.tenant_id
             vlan_id = new_network['provider:segmentation_id']
             with self.eos_sync_lock:
                 if db.is_network_provisioned(tenant_id, network_id):
@@ -808,7 +836,8 @@ class AristaDriver(driver_api.MechanismDriver):
                         network_dict = {
                             'network_id': network_id,
                             'segmentation_id': vlan_id,
-                            'network_name': network_name}
+                            'network_name': network_name,
+                        }
                         self.rpc.create_network(tenant_id, network_dict)
                     except arista_exc.AristaRpcError:
                         LOG.info(EOS_UNREACHABLE_MSG)
@@ -832,8 +861,14 @@ class AristaDriver(driver_api.MechanismDriver):
     def delete_network_postcommit(self, context):
         """Send network delete request to Arista HW."""
         network = context.current
+        segments = context.network_segments
+        if segments[0][driver_api.NETWORK_TYPE] != p_const.TYPE_VLAN:
+            # If networtk type is not VLAN, do nothing
+            return
         network_id = network['id']
         tenant_id = network['tenant_id']
+        if not tenant_id:
+            tenant_id = context._plugin_context.tenant_id
         with self.eos_sync_lock:
 
             # Succeed deleting network in case EOS is not accessible.
@@ -862,7 +897,13 @@ class AristaDriver(driver_api.MechanismDriver):
             port_id = port['id']
             network_id = port['network_id']
             tenant_id = port['tenant_id']
+            if not tenant_id:
+                tenant_id = context._plugin_context.tenant_id
             with self.eos_sync_lock:
+                if not db.is_network_provisioned(tenant_id, network_id):
+                    # Ignore this request if network is not provisioned
+                    return
+                db.remember_tenant(tenant_id)
                 db.remember_vm(device_id, host, port_id,
                                network_id, tenant_id)
 
@@ -884,6 +925,8 @@ class AristaDriver(driver_api.MechanismDriver):
             port_name = port['name']
             network_id = port['network_id']
             tenant_id = port['tenant_id']
+            if not tenant_id:
+                tenant_id = context._plugin_context.tenant_id
             with self.eos_sync_lock:
                 hostname = self._host_name(host)
                 vm_provisioned = db.is_vm_provisioned(device_id,
@@ -923,6 +966,21 @@ class AristaDriver(driver_api.MechanismDriver):
         if new_port['name'] != orig_port['name']:
             msg = _('Port name changed to %s') % new_port['name']
             LOG.info(msg)
+        device_id = new_port['device_id']
+        device_owner = new_port['device_owner']
+        host = context.host
+
+        # device_id and device_owner are set on VM boot
+        is_vm_boot = device_id and device_owner
+        if host and host != orig_port['binding:host_id'] and is_vm_boot:
+            port_id = new_port['id']
+            network_id = new_port['network_id']
+            tenant_id = new_port['tenant_id']
+            if not tenant_id:
+                tenant_id = context._plugin_context.tenant_id
+            with self.eos_sync_lock:
+                db.update_vm_host(device_id, host, port_id,
+                                  network_id, tenant_id)
 
     def update_port_postcommit(self, context):
         """Update the name of a given port in EOS.
@@ -932,9 +990,6 @@ class AristaDriver(driver_api.MechanismDriver):
         """
         port = context.current
         orig_port = context.original
-        if port['name'] == orig_port['name']:
-            # nothing to do
-            return
 
         device_id = port['device_id']
         device_owner = port['device_owner']
@@ -946,6 +1001,8 @@ class AristaDriver(driver_api.MechanismDriver):
             port_name = port['name']
             network_id = port['network_id']
             tenant_id = port['tenant_id']
+            if not tenant_id:
+                tenant_id = context._plugin_context.tenant_id
             with self.eos_sync_lock:
                 hostname = self._host_name(host)
                 segmentation_id = db.get_segmentation_id(tenant_id,
@@ -960,6 +1017,12 @@ class AristaDriver(driver_api.MechanismDriver):
                                                             segmentation_id)
                 if vm_provisioned and net_provisioned:
                     try:
+                        orig_host = orig_port['binding:host_id']
+                        if host != orig_host:
+                            # The port moved to a different host. So delete the
+                            # old port on the old host before creating a new
+                            # port on the new host.
+                            self._delete_port(port, orig_host, tenant_id)
                         self.rpc.plug_port_into_network(device_id,
                                                         hostname,
                                                         port_id,
@@ -982,6 +1045,8 @@ class AristaDriver(driver_api.MechanismDriver):
         host_id = context.host
         device_id = port['device_id']
         tenant_id = port['tenant_id']
+        if not tenant_id:
+            tenant_id = context._plugin_context.tenant_id
         network_id = port['network_id']
         port_id = port['id']
         with self.eos_sync_lock:
@@ -999,28 +1064,47 @@ class AristaDriver(driver_api.MechanismDriver):
         from appropriate network.
         """
         port = context.current
-        device_id = port['device_id']
         host = context.host
+        tenant_id = port['tenant_id']
+        if not tenant_id:
+            tenant_id = context._plugin_context.tenant_id
+
+        with self.eos_sync_lock:
+            self._delete_port(port, host, tenant_id)
+
+    def _delete_port(self, port, host, tenant_id):
+        """Deletes the port from EOS.
+
+        param port: Port which is to be deleted
+        param host: The host on which the port existed
+        param tenant_id: The tenant to which the port belongs to. Some times
+                         the tenant id in the port dict is not present (as in
+                         the case of HA router).
+        """
+        device_id = port['device_id']
         port_id = port['id']
         network_id = port['network_id']
-        tenant_id = port['tenant_id']
         device_owner = port['device_owner']
 
         try:
-            with self.eos_sync_lock:
-                hostname = self._host_name(host)
-                if device_owner == n_const.DEVICE_OWNER_DHCP:
-                    self.rpc.unplug_dhcp_port_from_network(device_id,
-                                                           hostname,
-                                                           port_id,
-                                                           network_id,
-                                                           tenant_id)
-                else:
-                    self.rpc.unplug_host_from_network(device_id,
-                                                      hostname,
-                                                      port_id,
-                                                      network_id,
-                                                      tenant_id)
+            if not db.is_network_provisioned(tenant_id, network_id):
+                # If we do not have network associated with this, ignore it
+                return
+            hostname = self._host_name(host)
+            if device_owner == n_const.DEVICE_OWNER_DHCP:
+                self.rpc.unplug_dhcp_port_from_network(device_id,
+                                                       hostname,
+                                                       port_id,
+                                                       network_id,
+                                                       tenant_id)
+            else:
+                self.rpc.unplug_host_from_network(device_id,
+                                                  hostname,
+                                                  port_id,
+                                                  network_id,
+                                                  tenant_id)
+            # if necessary, delete tenant as well.
+            self.delete_tenant(tenant_id)
         except arista_exc.AristaRpcError:
             LOG.info(EOS_UNREACHABLE_MSG)
             raise ml2_exc.MechanismDriverError()

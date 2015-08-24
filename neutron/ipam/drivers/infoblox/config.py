@@ -39,14 +39,26 @@ neutron_conf.CONF.register_opts(OPTS)
 
 
 class ConfigFinder(object):
+    """
+    _variable_conditions: contains tenant_id or subnet_range "condition"
+    _static_conditions: contains global or tenant "condition"
+    _assigned_members: contains dhcp members to be registered in db
+                       with its mapping id as network view
+    """
     VALID_STATIC_CONDITIONS = ['global', 'tenant']
     VALID_VARIABLE_CONDITIONS = ['tenant_id:', 'subnet_range:']
     VALID_CONDITIONS = VALID_STATIC_CONDITIONS + VALID_VARIABLE_CONDITIONS
 
     def __init__(self, stream=None, member_manager=None):
         """Reads config from `io.IOBase`:stream:. Config is JSON format."""
+        self._member_manager = member_manager
+        self._variable_conditions = []
+        self._static_conditions = []
+        self._assigned_members = dict()
+        self._is_member_registered = False
+
         if not member_manager:
-            member_manager = MemberManager()
+            self._member_manager = MemberManager()
         if not stream:
             config_file = neutron_conf.CONF.conditional_config
             if not config_file:
@@ -54,18 +66,70 @@ class ConfigFinder(object):
                     msg="Config not found")
             stream = io.FileIO(config_file)
 
-        self.member_manager = member_manager
-
-        self.variable_conditions = []
-        self.static_conditions = []
-
         with stream:
             try:
-                self.conf = jsonutils.loads(stream.read())
-                self.static_conditions, self.variable_conditions = \
-                    self._validate_conditions()
+                self._conf = jsonutils.loads(stream.read())
+                self._read_conditions()
             except ValueError as e:
                 raise exceptions.InfobloxConfigException(msg=e)
+
+    def configure_members(self, context):
+        # Do this only once after neutron server is restarted
+        if self._is_member_registered:
+            return
+
+        reg_members = self._member_manager.get_registered_members(
+            context)
+
+        # 1. register unregistered members
+        # -------------------------------------------------------
+        reg_member_names = []
+        # if never been registered
+        if len(reg_members) > 0:
+            reg_member_names = map(operator.attrgetter('name'),
+                                   reg_members)
+        reg_member_name_set = set(reg_member_names)
+        conf_member_name_set = set(
+            map(operator.attrgetter('name'),
+                self._member_manager.configured_members)
+        )
+        unreg_member_name_set = conf_member_name_set.difference(
+            reg_member_name_set)
+        self._member_manager.register_members(context,
+                                              list(unreg_member_name_set))
+
+        # 2. reserve the assigned members
+        # -------------------------------------------------------
+        reserv_member_names = []
+        reserv_mapped_ids = []
+        if len(reg_members) > 0:
+            zip_list = zip(*[(m.name, m.map_id)
+                             for m in reg_members if m.map_id])
+            if len(zip_list) == 2:
+                reserv_member_names = list(zip_list[0])
+                reserv_mapped_ids = list(zip_list[1])
+        reserv_member_name_set = set(reserv_member_names)
+
+        for netview, memberset in self._assigned_members.items():
+            if netview in reserv_mapped_ids:
+                continue
+
+            unreserv_member_name_set = memberset.difference(
+                reserv_member_name_set)
+            if len(unreserv_member_name_set) == 0:
+                continue
+
+            member_name = unreserv_member_name_set.pop()
+            self._member_manager.reserve_member(context,
+                                                netview,
+                                                member_name,
+                                                ib_models.DHCP_MEMBER_TYPE)
+            self._member_manager.reserve_member(context,
+                                                netview,
+                                                member_name,
+                                                ib_models.DNS_MEMBER_TYPE)
+
+        self._is_member_registered = True
 
     def find_config_for_subnet(self, context, subnet):
         """
@@ -74,10 +138,13 @@ class ConfigFinder(object):
         :param subnet:
         :return: :raise exceptions.InfobloxConfigException:
         """
+        if not self._is_member_registered:
+            self.configure_members(context)
+
         # First search for matching variable condition
-        for conditions in [self.variable_conditions, self.static_conditions]:
+        for conditions in [self._variable_conditions, self._static_conditions]:
             for cfg in conditions:
-                cfg = Config(cfg, context, subnet, self.member_manager)
+                cfg = Config(cfg, context, subnet, self._member_manager)
                 if self._condition_matches(context, cfg, subnet):
                     return cfg
 
@@ -86,9 +153,9 @@ class ConfigFinder(object):
 
     def get_all_configs(self, context, subnet):
         cfgs = []
-        for conditions in [self.variable_conditions, self.static_conditions]:
+        for conditions in [self._variable_conditions, self._static_conditions]:
             for cfg in conditions:
-                cfg = Config(cfg, context, subnet, self.member_manager)
+                cfg = Config(cfg, context, subnet, self._member_manager)
                 cfgs.append(cfg)
         return cfgs
 
@@ -111,31 +178,41 @@ class ConfigFinder(object):
 
         return config.is_external == is_external and condition_matches
 
-    def _validate_conditions(self):
+    def _read_conditions(self):
         # Define lambdas to check
         is_static_cond = lambda cond, static_conds: cond in static_conds
         is_var_cond = lambda cond, var_conds: any([cond.startswith(valid)
                                                   for valid in var_conds])
 
-        static_conditions = []
-        variable_conditions = []
-
-        for conf in self.conf:
+        for conf in self._conf:
             # If condition contain colon: validate it as variable
             if ':' in conf['condition'] and\
                 is_var_cond(conf['condition'],
-                           self.VALID_VARIABLE_CONDITIONS):
-                variable_conditions.append(conf)
+                            self.VALID_VARIABLE_CONDITIONS):
+                self._variable_conditions.append(conf)
             # If not: validate it as static
             elif is_static_cond(conf['condition'],
                                 self.VALID_STATIC_CONDITIONS):
-                static_conditions.append(conf)
+                self._static_conditions.append(conf)
             # If any of previous checker cannot validate value - rise error
             else:
                 msg = 'Invalid condition specified: {0}'.format(
                       conf['condition'])
                 raise exceptions.InfobloxConfigException(msg=msg)
-        return static_conditions, variable_conditions
+
+            # Look for assigned member; if dhcp_members list specific
+            # members, then network_view should be static as well
+            netview = conf.get('network_view', 'default')
+            members = conf.get('dhcp_members', Config.NEXT_AVAILABLE_MEMBER)
+            if not isinstance(members, list) and \
+                    members != Config.NEXT_AVAILABLE_MEMBER:
+                members = [members]
+            if isinstance(members, list) and \
+                    not netview.startswith('{'):
+                if self._assigned_members.get(netview):
+                    self._assigned_members[netview].update(set(members))
+                else:
+                    self._assigned_members[netview] = set(members)
 
 
 class PatternBuilder(object):
@@ -208,7 +285,7 @@ class Config(object):
     def __init__(self, config_dict, context, subnet,
                  member_manager=None):
         if not member_manager:
-            member_manager = MemberManager()
+            _member_manager = MemberManager()
 
         if 'condition' not in config_dict:
             raise exceptions.InfobloxConfigException(
@@ -245,7 +322,7 @@ class Config(object):
 
         self.context = context
         self.subnet = subnet
-        self.member_manager = member_manager
+        self._member_manager = member_manager
 
     def __eq__(self, other):
         return (isinstance(other, self.__class__) and
@@ -301,9 +378,9 @@ class Config(object):
         return self.condition == 'global'
 
     def reserve_dns_members(self):
-        reserved_members = self._reserve_member(self._dns_members,
-                                                self.ns_group,
-                                                ib_models.DNS_MEMBER_TYPE)
+        reserved_members = self._reserve_members(self._dns_members,
+                                                 self.ns_group,
+                                                 ib_models.DNS_MEMBER_TYPE)
 
         if isinstance(reserved_members, list):
             return reserved_members
@@ -313,20 +390,17 @@ class Config(object):
             return []
 
     def reserve_dhcp_members(self):
-        reserved_members = self._reserve_member(self._dhcp_members,
-                                                self.network_template,
-                                                ib_models.DHCP_MEMBER_TYPE)
-        # use DHCP member for DNS if DNS is not set
-        if self._dns_members is None:
-            self._dns_members = self._dhcp_members
-            self._reserve_member(self._dhcp_members,
-                                 self.network_template,
-                                 ib_models.DNS_MEMBER_TYPE)
+        reserved_members = self._reserve_members(self._dhcp_members,
+                                                 self.network_template,
+                                                 ib_models.DHCP_MEMBER_TYPE)
 
         if isinstance(reserved_members, list):
             return reserved_members
         else:
             return [reserved_members]
+
+    def release_member(self, map_id):
+        self._member_manager.release_member(self.context, map_id)
 
     def requires_net_view(self):
         return True
@@ -377,9 +451,9 @@ class Config(object):
             self._net_view_scope = 'static'
 
     def _get_members(self, member_type):
-        members = self.member_manager.find_members(
-            self.context, self.network_view, member_type)
-
+        members = self._member_manager.find_members(self.context,
+                                                    self.network_view,
+                                                    member_type)
         if members:
             return members
 
@@ -389,64 +463,63 @@ class Config(object):
                "first!".format(member_type=member_type))
         raise RuntimeError(msg)
 
-    def _reserve_members_list(self, members, member_type):
-        members_to_reserve = [self.member_manager.get_member(member)
-                              for member in members]
+    def _reserve_members_list(self, assigned_members, member_type):
+        members_to_reserve = [self._member_manager.get_member(member)
+                              for member in assigned_members]
         for member in members_to_reserve:
-            self.member_manager.reserve_member(self.context,
-                                               self.network_view,
-                                               member.name,
-                                               member_type)
+            self._member_manager.reserve_member(self.context,
+                                                self.network_view,
+                                                member.name,
+                                                member_type)
         return members_to_reserve
 
-    def _reserve_by_template(self, members, template, member_type):
-        member = self._get_member_from_template(members, template)
-        self.member_manager.reserve_member(self.context,
-                                           self.network_view,
-                                           member.name,
-                                           member_type)
+    def _reserve_by_template(self, assigned_members, template, member_type):
+        member = self._get_member_from_template(assigned_members, template)
+        self._member_manager.reserve_member(self.context,
+                                            self.network_view,
+                                            member.name,
+                                            member_type)
         return member
 
-    def _reserve_next_avaliable(self, members, member_type):
-        member = self.member_manager.next_available(self.context,
-                                                    members,
+    def _reserve_next_avaliable(self, member_type):
+        member = self._member_manager.next_available(self.context,
+                                                     member_type)
+        self._member_manager.reserve_member(self.context,
+                                            self.network_view,
+                                            member.name,
+                                            member_type)
+        return member
+
+    def _reserve_members(self, assigned_members, template, member_type):
+        members = self._member_manager.find_members(self.context,
+                                                    self.network_view,
                                                     member_type)
-        self.member_manager.reserve_member(self.context,
-                                           self.network_view,
-                                           member.name,
-                                           member_type)
-        return member
+        if members:
+            return members
 
-    def _reserve_member(self, members, template, member_type):
-        member = self.member_manager.find_members(self.context,
-                                                  self.network_view,
-                                                  member_type)
-
-        if member:
-            return member
-
-        if members == self.NEXT_AVAILABLE_MEMBER:
-            return self._reserve_next_avaliable(members, member_type)
-        elif isinstance(members, list):
-            return self._reserve_members_list(members, member_type)
+        if assigned_members == self.NEXT_AVAILABLE_MEMBER:
+            return self._reserve_next_avaliable(member_type)
+        elif isinstance(assigned_members, list):
+            return self._reserve_members_list(assigned_members,
+                                              member_type)
         elif template:
-            return self._reserve_by_template(members,
+            return self._reserve_by_template(assigned_members,
                                              template,
                                              member_type)
 
-    def _get_member_from_template(self, members, template):
-        member_defined = (members != self.NEXT_AVAILABLE_MEMBER and
-                          isinstance(members, basestring))
+    def _get_member_from_template(self, assigned_members, template):
+        member_defined = (assigned_members != self.NEXT_AVAILABLE_MEMBER
+                          and isinstance(assigned_members, basestring))
         if template and not member_defined:
             msg = 'Member MUST be configured for {template}'.format(
                 template=template)
             raise exceptions.InfobloxConfigException(msg=msg)
-        return self.member_manager.get_member(members)
+        return self._member_manager.get_member(assigned_members)
 
     def _members_identifier(self, members):
-        if not isinstance(members, list) and\
-           members != self.NEXT_AVAILABLE_MEMBER:
-            members = list(members)
+        if not isinstance(members, list) and \
+                members != self.NEXT_AVAILABLE_MEMBER:
+            members = [members]
         return members
 
 
@@ -457,71 +530,88 @@ class MemberManager(object):
             if not config_file:
                 raise exceptions.InfobloxConfigException(
                     msg="Config not found")
-
             member_config_stream = io.FileIO(config_file)
+
         with member_config_stream:
             all_members = jsonutils.loads(member_config_stream.read())
 
             try:
-                self.available_members = map(
-                    lambda m: objects.Member(name=m.get('name'), ip=m.get('ipv4addr'),
-                                             ipv6=m.get('ipv6addr')),
-                    filter(lambda m: m.get('is_available', True), all_members))
+                self.configured_members = map(
+                    lambda m: objects.Member(name=m.get('name'),
+                                             ip=m.get('ipv4addr'),
+                                             ipv6=m.get('ipv6addr'),
+                                             delegate=m.get('delegate'),
+                                             map_id=None),
+                    filter(lambda m: m.get('is_available', True),
+                           all_members))
             except KeyError as key:
                 raise exceptions.InfobloxConfigException(
                     msg="Invalid member config key: %s" % key)
 
+        if self.configured_members is None or \
+                len(self.configured_members) == 0:
+            raise exceptions.InfobloxConfigException(
+                msg="Configured member not found")
+
     def __repr__(self):
         values = {
-            'available_members': self.available_members
+            'configured_members': self.configured_members
         }
         return "MemberManager{0}".format(values)
 
-    def next_available(self, context,
-                       members_to_choose_from=Config.NEXT_AVAILABLE_MEMBER,
-                       member_type=ib_models.DHCP_MEMBER_TYPE):
-        if members_to_choose_from == Config.NEXT_AVAILABLE_MEMBER:
-            members_to_choose_from = map(operator.attrgetter('name'),
-                                         self.available_members)
+    def register_members(self, context, member_names):
+        for member_name in member_names:
+            ib_db.register_member(context, None, member_name,
+                                  ib_models.DHCP_MEMBER_TYPE)
+            ib_db.register_member(context, None, member_name,
+                                  ib_models.DNS_MEMBER_TYPE)
 
-        already_reserved = ib_db.get_used_members(context, member_type)
-        for member in members_to_choose_from:
-            if member not in already_reserved:
-                return self.get_member(member)
-        raise exceptions.InfobloxConfigException(
-            msg="No infoblox member available")
+    def get_registered_members(self, context,
+                               member_type=ib_models.DHCP_MEMBER_TYPE):
+        registered_members = ib_db.get_registered_members(context,
+                                                          member_type)
+        members = []
+        for reg_member in registered_members:
+            for member in self.configured_members:
+                if member.name == reg_member.member_name:
+                    member.map_id = reg_member.map_id
+                    members.append(member)
+        return members
+
+    def next_available(self, context, member_type):
+        avail_member = ib_db.get_available_member(context, member_type)
+        if not avail_member:
+            raise exceptions.InfobloxConfigException(
+                msg="No infoblox member available")
+
+        return self.get_member(avail_member.member_name)
 
     def reserve_member(self, context, mapping, member_name, member_type):
         ib_db.attach_member(context, mapping, member_name, member_type)
 
     def release_member(self, context, mapping):
-        ib_db.delete_members(context, mapping)
+        ib_db.release_member(context, mapping)
 
     def get_member(self, member_name):
-        for member in self.available_members:
+        for member in self.configured_members:
             if member.name == member_name:
                 return member
         raise exceptions.InfobloxConfigException(
             msg="No infoblox member available")
 
-    def _get_reserved_conf_members(self, exists_members):
+    def find_members(self, context, map_id, member_type):
+        existing_members = ib_db.get_members(context, map_id, member_type)
+        if not existing_members:
+            return []
+
         members = []
-
-        if not exists_members:
-            return members
-
-        for exists_member in exists_members:
-            for member in self.available_members:
-                if member.name == exists_member:
+        for existing_member in existing_members:
+            for member in self.configured_members:
+                if member.name == existing_member.member_name:
                     members.append(member)
 
         if not members:
             msg = "Reserved member not available in config"
             raise exceptions.InfobloxConfigException(msg=msg)
 
-        return members
-
-    def find_members(self, context, mapping, member_type):
-        exists_members = ib_db.get_members(context, mapping, member_type)
-        members = self._get_reserved_conf_members(exists_members)
         return members
