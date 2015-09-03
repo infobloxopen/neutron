@@ -679,7 +679,8 @@ class Ml2Plugin(db_base_plugin_v2.NeutronDbPluginV2,
         for port in ports:
             try:
                 self.delete_port(context, port.id)
-            except exc.PortNotFound:
+            except (exc.PortNotFound, sa_exc.ObjectDeletedError):
+                context.session.expunge(port)
                 # concurrent port deletion can be performed by
                 # release_dhcp_port caused by concurrent subnet_delete
                 LOG.info(_LI("Port %s was deleted concurrently"), port.id)
@@ -692,7 +693,8 @@ class Ml2Plugin(db_base_plugin_v2.NeutronDbPluginV2,
         for subnet in subnets:
             try:
                 self.delete_subnet(context, subnet.id)
-            except exc.SubnetNotFound:
+            except (exc.SubnetNotFound, sa_exc.ObjectDeletedError):
+                context.session.expunge(subnet)
                 LOG.info(_LI("Subnet %s was deleted concurrently"),
                          subnet.id)
             except Exception:
@@ -1213,6 +1215,8 @@ class Ml2Plugin(db_base_plugin_v2.NeutronDbPluginV2,
                 raise e.errors[0].error
             raise exc.ServicePortInUse(port_id=port_id, reason=e)
 
+    @oslo_db_api.wrap_db_retry(max_retries=db_api.MAX_RETRIES,
+                               retry_on_deadlock=True)
     def delete_port(self, context, id, l3_port_check=True):
         self._pre_delete_port(context, id, l3_port_check)
         # TODO(armax): get rid of the l3 dependency in the with block

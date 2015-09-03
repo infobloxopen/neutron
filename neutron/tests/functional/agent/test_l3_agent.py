@@ -38,7 +38,6 @@ from neutron.agent.linux import external_process
 from neutron.agent.linux import ip_lib
 from neutron.agent.linux import utils
 from neutron.callbacks import events
-from neutron.callbacks import manager
 from neutron.callbacks import registry
 from neutron.callbacks import resources
 from neutron.common import config as common_config
@@ -48,7 +47,7 @@ from neutron.openstack.common import uuidutils
 from neutron.tests.common import net_helpers
 from neutron.tests.functional.agent.linux import base
 from neutron.tests.functional.agent.linux import helpers
-from neutron.tests.unit import test_l3_agent
+from neutron.tests.unit.agent.l3 import test_agent as test_l3_agent
 
 LOG = logging.getLogger(__name__)
 _uuid = uuidutils.generate_uuid
@@ -63,13 +62,8 @@ def get_ovs_bridge(br_name):
 class L3AgentTestFramework(base.BaseOVSLinuxTestCase):
     def setUp(self):
         super(L3AgentTestFramework, self).setUp()
-        mock.patch('neutron.agent.l3.agent.L3PluginApi').start()
-
-        # TODO(pcm): Move this to BaseTestCase, if we find that more tests
-        # use this mechanism.
-        self._callback_manager = manager.CallbacksManager()
-        mock.patch.object(registry, '_get_callback_manager',
-                          return_value=self._callback_manager).start()
+        self.mock_plugin_api = mock.patch(
+            'neutron.agent.l3.agent.L3PluginApi').start().return_value
         self.agent = self._configure_agent('agent1')
 
     def _get_config_opts(self):
@@ -119,9 +113,6 @@ class L3AgentTestFramework(base.BaseOVSLinuxTestCase):
             enable_fip = False
             extra_routes = False
 
-        if not v6_ext_gw_with_sub:
-            self.agent.conf.set_override('ipv6_gateway',
-                                         'fe80::f816:3eff:fe2e:1')
         return test_l3_agent.prepare_router_data(ip_version=ip_version,
                                                  enable_snat=enable_snat,
                                                  enable_floating_ip=enable_fip,
@@ -210,6 +201,8 @@ class L3AgentTestFramework(base.BaseOVSLinuxTestCase):
     interface %(ha_device_name)s
     virtual_router_id 1
     priority 50
+    garp_master_repeat 5
+    garp_master_refresh 10
     nopreempt
     advert_int 2
     track_interface {
@@ -399,6 +392,8 @@ class L3AgentTestCase(L3AgentTestFramework):
         self._router_lifecycle(enable_ha=False, dual_stack=True)
 
     def test_legacy_router_lifecycle_with_no_gateway_subnet(self):
+        self.agent.conf.set_override('ipv6_gateway',
+                                     'fe80::f816:3eff:fe2e:1')
         self._router_lifecycle(enable_ha=False, dual_stack=True,
                                v6_ext_gw_with_sub=False)
 
@@ -453,6 +448,18 @@ class L3AgentTestCase(L3AgentTestFramework):
     def test_ipv6_ha_router_lifecycle(self):
         self._router_lifecycle(enable_ha=True, ip_version=6)
 
+    def test_ipv6_ha_router_lifecycle_with_no_gw_subnet(self):
+        self.agent.conf.set_override('ipv6_gateway',
+                                     'fe80::f816:3eff:fe2e:1')
+        self._router_lifecycle(enable_ha=True, ip_version=6,
+                               v6_ext_gw_with_sub=False)
+
+    def test_ipv6_ha_router_lifecycle_with_no_gw_subnet_for_router_advts(self):
+        # Verify that router gw interface is configured to receive Router
+        # Advts from upstream router when no external gateway is configured.
+        self._router_lifecycle(enable_ha=True, dual_stack=True,
+                               v6_ext_gw_with_sub=False)
+
     def test_keepalived_configuration(self):
         router_info = self.generate_router_info(enable_ha=True)
         router = self.manage_router(self.agent, router_info)
@@ -503,23 +510,23 @@ class L3AgentTestCase(L3AgentTestFramework):
         routers_to_keep = []
         routers_to_delete = []
         ns_names_to_retrieve = set()
+        routers_info_to_delete = []
         for i in range(2):
             routers_to_keep.append(self.generate_router_info(False))
-            self.manage_router(self.agent, routers_to_keep[i])
-            ns_names_to_retrieve.add(namespaces.NS_PREFIX +
-                                     routers_to_keep[i]['id'])
+            ri = self.manage_router(self.agent, routers_to_keep[i])
+            ns_names_to_retrieve.add(ri.ns_name)
         for i in range(2):
             routers_to_delete.append(self.generate_router_info(False))
-            self.manage_router(self.agent, routers_to_delete[i])
-            ns_names_to_retrieve.add(namespaces.NS_PREFIX +
-                                     routers_to_delete[i]['id'])
+            ri = self.manage_router(self.agent, routers_to_delete[i])
+            routers_info_to_delete.append(ri)
+            ns_names_to_retrieve.add(ri.ns_name)
 
         # Mock the plugin RPC API to Simulate a situation where the agent
         # was handling the 4 routers created above, it went down and after
         # starting up again, two of the routers were deleted via the API
-        mocked_get_routers = (
-            neutron_l3_agent.L3PluginApi.return_value.get_routers)
-        mocked_get_routers.return_value = routers_to_keep
+        self.mock_plugin_api.get_routers.return_value = routers_to_keep
+        # also clear agent router_info as it will be after restart
+        self.agent.router_info = {}
 
         # Synchonize the agent with the plug-in
         with mock.patch.object(namespace_manager.NamespaceManager, 'list_all',
@@ -529,9 +536,8 @@ class L3AgentTestCase(L3AgentTestFramework):
         # Mock the plugin RPC API so a known external network id is returned
         # when the router updates are processed by the agent
         external_network_id = _uuid()
-        mocked_get_external_network_id = (
-            neutron_l3_agent.L3PluginApi.return_value.get_external_network_id)
-        mocked_get_external_network_id.return_value = external_network_id
+        self.mock_plugin_api.get_external_network_id.return_value = (
+            external_network_id)
 
         # Plug external_gateway_info in the routers that are not going to be
         # deleted by the agent when it processes the updates. Otherwise,
@@ -542,7 +548,7 @@ class L3AgentTestCase(L3AgentTestFramework):
 
         # Have the agent process the update from the plug-in and verify
         # expected behavior
-        for _ in routers_to_keep + routers_to_delete:
+        for _ in routers_to_keep:
             self.agent._process_router_update()
 
         for i in range(2):
@@ -550,10 +556,9 @@ class L3AgentTestCase(L3AgentTestFramework):
             self.assertTrue(self._namespace_exists(namespaces.NS_PREFIX +
                                                    routers_to_keep[i]['id']))
         for i in range(2):
-            self.assertNotIn(routers_to_delete[i]['id'],
+            self.assertNotIn(routers_info_to_delete[i].router_id,
                              self.agent.router_info)
-            self.assertFalse(self._namespace_exists(
-                namespaces.NS_PREFIX + routers_to_delete[i]['id']))
+            self._assert_router_does_not_exist(routers_info_to_delete[i])
 
     def _router_lifecycle(self, enable_ha, ip_version=4,
                           dual_stack=False, v6_ext_gw_with_sub=True):
@@ -606,6 +611,18 @@ class L3AgentTestCase(L3AgentTestFramework):
             self._assert_floating_ip_chains(router)
             self._assert_extra_routes(router)
         self._assert_metadata_chains(router)
+
+        # Verify router gateway interface is configured to receive Router Advts
+        # when IPv6 is enabled and no IPv6 gateway is configured.
+        if router.use_ipv6 and not v6_ext_gw_with_sub:
+            if not self.agent.conf.ipv6_gateway:
+                external_port = router.get_ex_gw_port()
+                external_device_name = router.get_external_device_name(
+                    external_port['id'])
+                ip_wrapper = ip_lib.IPWrapper(namespace=router.ns_name)
+                ra_state = ip_wrapper.netns.execute(['sysctl', '-b',
+                    'net.ipv6.conf.%s.accept_ra' % external_device_name])
+                self.assertEqual('2', ra_state)
 
         if enable_ha:
             self._assert_ha_device(router)
@@ -764,6 +781,79 @@ class L3HATestFramework(L3AgentTestFramework):
         utils.wait_until_true(lambda: router2.ha_state == 'master')
         utils.wait_until_true(lambda: router1.ha_state == 'backup')
 
+    def test_ha_router_ipv6_radvd_status(self):
+        router_info = self.generate_router_info(ip_version=6, enable_ha=True)
+        router1 = self.manage_router(self.agent, router_info)
+        utils.wait_until_true(lambda: router1.ha_state == 'master')
+        utils.wait_until_true(lambda: router1.radvd.enabled)
+
+        def _check_lla_status(router, expected):
+            internal_devices = router.router[l3_constants.INTERFACE_KEY]
+            for device in internal_devices:
+                lladdr = ip_lib.get_ipv6_lladdr(device['mac_address'])
+                exists = ip_lib.device_exists_with_ips_and_mac(
+                    router.get_internal_device_name(device['id']), [lladdr],
+                    device['mac_address'], router.ns_name)
+                self.assertEqual(expected, exists)
+
+        _check_lla_status(router1, True)
+
+        device_name = router1.get_ha_device_name()
+        ha_device = ip_lib.IPDevice(device_name, namespace=router1.ns_name)
+        ha_device.link.set_down()
+
+        utils.wait_until_true(lambda: router1.ha_state == 'backup')
+        utils.wait_until_true(lambda: not router1.radvd.enabled, timeout=10)
+        _check_lla_status(router1, False)
+
+    def test_ha_router_process_ipv6_subnets_to_existing_port(self):
+        router_info = self.generate_router_info(enable_ha=True, ip_version=6)
+        router = self.manage_router(self.agent, router_info)
+
+        def verify_ip_in_keepalived_config(router, iface):
+            config = router.keepalived_manager.config.get_config_str()
+            ip_cidrs = common_utils.fixed_ip_cidrs(iface['fixed_ips'])
+            for ip_addr in ip_cidrs:
+                self.assertIn(ip_addr, config)
+
+        interface_id = router.router[l3_constants.INTERFACE_KEY][0]['id']
+        slaac = l3_constants.IPV6_SLAAC
+        slaac_mode = {'ra_mode': slaac, 'address_mode': slaac}
+
+        # Add a second IPv6 subnet to the router internal interface.
+        self._add_internal_interface_by_subnet(router.router, count=1,
+                ip_version=6, ipv6_subnet_modes=[slaac_mode],
+                interface_id=interface_id)
+        router.process(self.agent)
+        utils.wait_until_true(lambda: router.ha_state == 'master')
+
+        # Verify that router internal interface is present and is configured
+        # with IP address from both the subnets.
+        internal_iface = router.router[l3_constants.INTERFACE_KEY][0]
+        self.assertEqual(2, len(internal_iface['fixed_ips']))
+        self._assert_internal_devices(router)
+
+        # Verify that keepalived config is properly updated.
+        verify_ip_in_keepalived_config(router, internal_iface)
+
+        # Remove one subnet from the router internal iface
+        interfaces = copy.deepcopy(router.router.get(
+            l3_constants.INTERFACE_KEY, []))
+        fixed_ips, subnets = [], []
+        fixed_ips.append(interfaces[0]['fixed_ips'][0])
+        subnets.append(interfaces[0]['subnets'][0])
+        interfaces[0].update({'fixed_ips': fixed_ips, 'subnets': subnets})
+        router.router[l3_constants.INTERFACE_KEY] = interfaces
+        router.process(self.agent)
+
+        # Verify that router internal interface has a single ipaddress
+        internal_iface = router.router[l3_constants.INTERFACE_KEY][0]
+        self.assertEqual(1, len(internal_iface['fixed_ips']))
+        self._assert_internal_devices(router)
+
+        # Verify that keepalived config is properly updated.
+        verify_ip_in_keepalived_config(router, internal_iface)
+
 
 class MetadataFakeProxyHandler(object):
 
@@ -904,15 +994,12 @@ class TestDvrRouter(L3AgentTestFramework):
         # gateway_port information before the l3_agent will create it.
         # The port returned needs to have the same information as
         # router_info['gw_port']
-        mocked_gw_port = (
-            neutron_l3_agent.L3PluginApi.return_value.get_agent_gateway_port)
-        mocked_gw_port.return_value = router_info['gw_port']
+        self.mock_plugin_api.get_agent_gateway_port.return_value = router_info[
+            'gw_port']
 
         # We also need to mock the get_external_network_id method to
         # get the correct fip namespace.
-        mocked_ext_net_id = (
-            neutron_l3_agent.L3PluginApi.return_value.get_external_network_id)
-        mocked_ext_net_id.return_value = (
+        self.mock_plugin_api.get_external_network_id.return_value = (
             router_info['_floatingips'][0]['floating_network_id'])
 
         # With all that set we can now ask the l3_agent to
@@ -1150,3 +1237,48 @@ class TestDvrRouter(L3AgentTestFramework):
             router.router_id, router.fip_ns.get_int_device_name,
             router.fip_ns.get_name())
         self.assertEqual(expected_mtu, dev_mtu)
+
+    def test_dvr_router_fip_agent_mismatch(self):
+        """Test to validate the floatingip agent mismatch.
+
+        This test validates the condition where floatingip agent
+        gateway port host mismatches with the agent and so the
+        binding will not be there.
+
+        """
+        self.agent.conf.agent_mode = 'dvr'
+        router_info = self.generate_dvr_router_info()
+        floating_ip = router_info['_floatingips'][0]
+        floating_ip['host'] = 'my_new_host'
+        # In this case the floatingip binding is different and so it
+        # should not create the floatingip namespace on the given agent.
+        # This is also like there is no current binding.
+        router1 = self.manage_router(self.agent, router_info)
+        fip_ns = router1.fip_ns.get_name()
+        self.assertTrue(self._namespace_exists(router1.ns_name))
+        self.assertFalse(self._namespace_exists(fip_ns))
+        self._assert_snat_namespace_does_not_exist(router1)
+
+    def test_dvr_router_fip_late_binding(self):
+        """Test to validate the floatingip migration or latebinding.
+
+        This test validates the condition where floatingip private
+        port changes while migration or when the private port host
+        binding is done later after floatingip association.
+
+        """
+        self.agent.conf.agent_mode = 'dvr'
+        router_info = self.generate_dvr_router_info()
+        fip_agent_gw_port = router_info[l3_constants.FLOATINGIP_AGENT_INTF_KEY]
+        # Now let us not pass the FLOATINGIP_AGENT_INTF_KEY, to emulate
+        # that the server did not create the port, since there was no valid
+        # host binding.
+        router_info[l3_constants.FLOATINGIP_AGENT_INTF_KEY] = []
+        mocked_gw_port = (
+            neutron_l3_agent.L3PluginApi.return_value.get_agent_gateway_port)
+        mocked_gw_port.return_value = fip_agent_gw_port[0]
+        router1 = self.manage_router(self.agent, router_info)
+        fip_ns = router1.fip_ns.get_name()
+        self.assertTrue(self._namespace_exists(router1.ns_name))
+        self.assertTrue(self._namespace_exists(fip_ns))
+        self._assert_snat_namespace_does_not_exist(router1)
