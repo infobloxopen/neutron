@@ -63,9 +63,9 @@ class InfobloxIPAM(neutron_ipam.NeutronIPAM):
         taskflow.engines.run(context.parent_flow, store=context.store)
         return retval
 
-    def _collect_members_ips(self, context, network, model):
+    def _collect_members_ips(self, context, network_id, model):
         members = context.session.query(model)
-        result = members.filter_by(network_id=network['id'])
+        result = members.filter_by(network_id=network_id)
         ip_list = []
         ipv6_list = []
         for member in result:
@@ -74,13 +74,11 @@ class InfobloxIPAM(neutron_ipam.NeutronIPAM):
         return (ip_list, ipv6_list)
 
     def get_additional_network_dict_params(self, ctx, network_id):
-        network = self.ipam_controller._get_network(ctx, network_id)
-
         dns_list, dns_ipv6_list = self._collect_members_ips(
-            ctx, network, models.InfobloxDNSMember)
+            ctx, network_id, models.InfobloxDNSMember)
 
         dhcp_list, dhcp_ipv6_list = self._collect_members_ips(
-            ctx, network, models.InfobloxDHCPMember)
+            ctx, network_id, models.InfobloxDHCPMember)
 
         ib_mgmt_ip = self.ipam_controller.ib_db.get_management_net_ip(
             ctx, network_id)
