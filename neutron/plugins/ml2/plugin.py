@@ -757,6 +757,10 @@ class Ml2Plugin(db_base_plugin_v2.NeutronDbPluginV2,
                             mech_context)
 
                         self.type_manager.release_network_segments(session, id)
+
+                        manager.NeutronManager.get_ipam().delete_network(
+                            context, id)
+
                         record = self._get_network(context, id)
                         LOG.debug("Deleting network record %s", record)
                         session.delete(record)
@@ -887,6 +891,9 @@ class Ml2Plugin(db_base_plugin_v2.NeutronDbPluginV2,
                                                                 subnet)
                     self.mechanism_manager.delete_subnet_precommit(
                         mech_context)
+
+                    manager.NeutronManager.get_ipam().delete_subnet(
+                        context, id)
 
                     LOG.debug("Deleting subnet record")
                     session.delete(record)

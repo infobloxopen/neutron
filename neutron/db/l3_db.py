@@ -546,6 +546,8 @@ class L3_NAT_dbonly_mixin(l3.RouterPluginBase):
                 raise n_exc.BadRequest(resource='router', msg=msg)
 
             port.update({'device_id': router.id, 'device_owner': owner})
+            ipam = manager.NeutronManager.get_ipam()
+            ipam.update_port(context, port)
             return port, subnets
 
     def _port_has_ipv6_address(self, port):
@@ -970,9 +972,12 @@ class L3_NAT_dbonly_mixin(l3.RouterPluginBase):
             fip['tenant_id'] = floatingip_db['tenant_id']
             fip['id'] = id
             fip_port_id = floatingip_db['floating_port_id']
-            self._update_fip_assoc(context, fip, floatingip_db,
-                                   self._core_plugin.get_port(
-                                       context.elevated(), fip_port_id))
+            port = self._core_plugin.get_port(context.elevated(),
+                                              fip_port_id)
+            self._update_fip_assoc(context, fip, floatingip_db, port)
+            ipam = manager.NeutronManager.get_ipam()
+            ipam.associate_floatingip(context, floatingip, port)
+
         return old_floatingip, self._make_floatingip_dict(floatingip_db)
 
     def _floatingips_to_router_ids(self, floatingips):
@@ -1083,6 +1088,10 @@ class L3_NAT_dbonly_mixin(l3.RouterPluginBase):
             floating_ips = fip_qry.filter_by(fixed_port_id=port_id)
             for floating_ip in floating_ips:
                 router_ids.add(floating_ip['router_id'])
+
+                ipam = manager.NeutronManager.get_ipam()
+                ipam.disassociate_floatingip(context, floating_ip, port_id)
+
                 floating_ip.update({'fixed_port_id': None,
                                     'fixed_ip_address': None,
                                     'router_id': None})

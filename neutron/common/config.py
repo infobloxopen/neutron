@@ -134,6 +134,9 @@ core_opts = [
     cfg.BoolOpt('vlan_transparent', default=False,
                 help=_('If True, then allow plugins that support it to '
                        'create VLAN transparent networks.')),
+    cfg.StrOpt('ipam_driver',
+               default='neutron.ipam.drivers.neutron_ipam.NeutronIPAM',
+               help=_('IPAM driver'))
 ]
 
 core_cli_opts = [
