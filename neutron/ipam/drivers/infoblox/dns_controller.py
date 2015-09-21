@@ -236,7 +236,8 @@ class InfobloxDNSController(neutron_ipam.NeutronDNSController):
         #       in the network.
         # Reverse zone is deleted when not global, not external, and not shared
         if neutron_conf.CONF.allow_admin_network_deletion or \
-                not (cfg.is_global_config or is_external or is_shared):
+                not (cfg.is_global_config or is_external or is_shared or
+                     neutron_conf.CONF.subnet_shared_for_deletion):
             if (('{subnet_name}' in cfg.domain_suffix_pattern or
                     '{subnet_id}' in cfg.domain_suffix_pattern) or
                 (('{network_name}' in cfg.domain_suffix_pattern or

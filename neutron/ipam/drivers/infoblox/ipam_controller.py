@@ -47,7 +47,17 @@ OPTS = [
     neutron_conf.BoolOpt('allow_admin_network_deletion',
                          default=False,
                          help=_("Allow admin network which is global, "
-                                "external, or shared to be deleted"))
+                                "external, or shared to be deleted")),
+    neutron_conf.BoolOpt('subnet_shared_for_creation',
+                         default=False,
+                         help=_("Treat subnet as shared during creation. "
+                                "When set to true, if network already exist "
+                                "on Infoblox, it will be shared")),
+    neutron_conf.BoolOpt('subnet_shared_for_deletion',
+                         default=False,
+                         help=_("Treat subnet as shared during deletion. "
+                                "When set to true, network on Infoblox is "
+                                "considered shared and therefore not deleted"))
 ]
 
 neutron_conf.CONF.register_opts(OPTS)
@@ -233,7 +243,8 @@ class InfobloxIPAMController(neutron_ipam.NeutronIPAMController):
                                                       subnet['network_id'])
 
         if neutron_conf.CONF.allow_admin_network_deletion or \
-            not (cfg.is_global_config or is_shared or is_external):
+            not (cfg.is_global_config or is_shared or is_external or
+                 neutron_conf.CONF.subnet_shared_for_deletion):
             self.infoblox.delete_network(
                 cfg.network_view, cidr=subnet['cidr'])
 
@@ -266,6 +277,10 @@ class InfobloxIPAMController(neutron_ipam.NeutronIPAMController):
         if network_view_scope == 'static':
             return self.ib_db.is_last_subnet(context, subnet_id)
         if network_view_scope == 'tenant_id':
+            return self.ib_db.is_last_subnet_in_tenant(context,
+                                                       subnet_id,
+                                                       tenant_id)
+        if network_view_scope == 'tenant_name':
             return self.ib_db.is_last_subnet_in_tenant(context,
                                                        subnet_id,
                                                        tenant_id)
