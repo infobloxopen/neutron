@@ -2251,8 +2251,8 @@ class NeutronIPAMPlugin(NeutronCorePluginV2):
 
         subnet_args['dns_nameservers'] = dns_nameservers
         subnet_args['host_routes'] = host_routes
+        subnet_args['allocation_pools'] = allocation_pools
         subnet = self.ipam.create_subnet(context, subnet_args)
-        # import pdb; pdb.set_trace()
         return subnet
 
 
